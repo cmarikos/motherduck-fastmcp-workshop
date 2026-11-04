@@ -183,6 +183,39 @@ def median_close_hours(
 
 
 @mcp.tool(annotations=READ_ONLY)
+def open_requests(
+    service: str | None = None,
+    neighborhood: str | None = None,
+    group_by: Literal["neighborhood", "service", "agency"] | None = None,
+) -> dict:
+    """Count 311 requests opened this week that are still open (the backlog).
+
+    Returns {"open": total, "oldest_open": the longest-waiting open request}
+    with its address given only to the block. With `group_by`, also returns
+    "by_<group>": a dict of group -> open count, largest first, at most 50
+    groups.
+
+    Use this for "how many are still open", "what's the backlog", or "which
+    neighborhood has the most unresolved" questions. For all requests
+    regardless of status, use count_requests. For how long closed requests
+    took, use median_close_hours.
+
+    `service` and `neighborhood` must be names from dataset_info.
+    """
+    rows = _matching(service, neighborhood, status="Open")
+    result: dict = {
+        "open": len(rows),
+        "oldest_open": _public(min(rows, key=lambda r: r.opened)) if rows else None,
+    }
+    if group_by is not None:
+        key = GROUPS[group_by]
+        counts = Counter(key(r) for r in rows if key(r))
+        ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        result[f"by_{group_by}"] = dict(ranked[:MAX_ROWS])
+    return result
+
+
+@mcp.tool(annotations=READ_ONLY)
 def get_request(request_id: str) -> dict:
     """Return every field of one 311 request, looked up by its request_id.
 
