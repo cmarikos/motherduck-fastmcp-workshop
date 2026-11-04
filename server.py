@@ -3,14 +3,59 @@
 FastMCP Gateway runs this file. Its entrypoint setting is `server.py:mcp`.
 """
 
-from fastmcp import FastMCP
+from collections import Counter, defaultdict
+from statistics import median
+from typing import Literal
 
-from sf311.data import LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+
+from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
 
 mcp = FastMCP("sf-311")
 
+MAX_ROWS = 50
+MIN_CLOSED_FOR_MEDIAN = 10
 
-@mcp.tool(annotations={"readOnlyHint": True})
+GROUPS = {
+    "neighborhood": lambda r: r.neighborhood,
+    "service": lambda r: r.service,
+    "agency": lambda r: r.agency,
+    "source": lambda r: r.source,
+    "weekday": lambda r: r.opened.strftime("%A"),
+    "status": lambda r: r.status,
+}
+
+READ_ONLY = {"readOnlyHint": True}
+
+
+def _resolve(value: str | None, choices: list[str], kind: str) -> str | None:
+    """Return the exact name for `value`, or raise a ToolError with suggestions."""
+    if value is None:
+        return None
+    if value in choices:
+        return value
+    by_lower = {choice.lower(): choice for choice in choices}
+    if value.strip().lower() in by_lower:
+        return by_lower[value.strip().lower()]
+    suggestions = closest(value, choices)
+    hint = f"Did you mean: {', '.join(suggestions)}?" if suggestions else "No close match."
+    raise ToolError(f"Unknown {kind} {value!r}. {hint} Call dataset_info for the full list of {kind} names.")
+
+
+def _matching(service: str | None, neighborhood: str | None, status: str | None = None) -> list[Request]:
+    service = _resolve(service, SERVICES, "service")
+    neighborhood = _resolve(neighborhood, NEIGHBORHOODS, "neighborhood")
+    return [
+        r
+        for r in REQUESTS
+        if (service is None or r.service == service)
+        and (neighborhood is None or r.neighborhood == neighborhood)
+        and (status is None or r.status == status)
+    ]
+
+
+@mcp.tool(annotations=READ_ONLY)
 def dataset_info() -> dict:
     """Describe the 311 dataset this server answers questions about.
 
@@ -26,6 +71,101 @@ def dataset_info() -> dict:
         "neighborhoods": NEIGHBORHOODS,
         "local_neighborhood_names": len(LOCAL_NAMES),
     }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def search_requests(
+    service: str | None = None,
+    neighborhood: str | None = None,
+    status: Literal["Open", "Closed"] | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    """List individual 311 requests that match the filters, newest first.
+
+    Returns up to `limit` rows (1 to 50), each with request_id, opened, closed,
+    status, service, subtype, agency, neighborhood, local_name, address and source.
+    Use this to see examples or details of specific cases.
+
+    Do not use this to count or to compute times: it returns a sample, not
+    every match. Use count_requests for "how many" questions and
+    median_close_hours for "how long" questions. Use get_request when you
+    already have a request_id.
+
+    `service` and `neighborhood` must be names from dataset_info.
+    """
+    if not 1 <= limit <= MAX_ROWS:
+        raise ToolError(f"limit must be between 1 and {MAX_ROWS}. For totals, use count_requests instead of listing rows.")
+    rows = sorted(_matching(service, neighborhood, status), key=lambda r: r.opened, reverse=True)
+    return [r.as_dict() for r in rows[:limit]]
+
+
+@mcp.tool(annotations=READ_ONLY)
+def count_requests(
+    service: str | None = None,
+    neighborhood: str | None = None,
+    group_by: Literal["neighborhood", "service", "agency", "source", "weekday", "status"] | None = None,
+) -> int | dict[str, int]:
+    """Count 311 requests this week, optionally filtered and broken down.
+
+    Without `group_by`, returns one number: how many requests match.
+    With `group_by`, returns a dict of group -> count, largest first, at most
+    50 groups (requests with a blank value for that field are left out).
+    `weekday` groups by the day the request was opened, e.g. "Monday".
+
+    Use this for any "how many", "which has the most", or ranking question.
+    For how long requests take to close, use median_close_hours instead.
+
+    `service` and `neighborhood` must be names from dataset_info.
+    """
+    rows = _matching(service, neighborhood)
+    if group_by is None:
+        return len(rows)
+    key = GROUPS[group_by]
+    counts = Counter(key(r) for r in rows if key(r))
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return dict(ranked[:MAX_ROWS])
+
+
+@mcp.tool(annotations=READ_ONLY)
+def median_close_hours(
+    service: str | None = None,
+    group_by: Literal["neighborhood", "agency"] | None = None,
+) -> float | None | dict[str, float]:
+    """Median hours from opened to closed for closed 311 requests, rounded to 0.1.
+
+    Only closed requests count; open ones have no close time. Without
+    `group_by`, returns one number (null if nothing matching has closed).
+    With `group_by`, returns a dict of group -> median hours, fastest first,
+    leaving out groups with fewer than 10 closed requests.
+
+    Use this for "how long does it take" or "which is fastest/slowest to close"
+    questions. For how many requests there are, use count_requests.
+
+    `service` must be a name from dataset_info.
+    """
+    rows = [r for r in _matching(service, None) if r.hours_to_close is not None]
+    if group_by is None:
+        return round(median(r.hours_to_close for r in rows), 1) if rows else None
+    key = GROUPS[group_by]
+    hours: dict[str, list[float]] = defaultdict(list)
+    for r in rows:
+        if key(r):
+            hours[key(r)].append(r.hours_to_close)
+    medians = {group: round(median(values), 1) for group, values in hours.items() if len(values) >= MIN_CLOSED_FOR_MEDIAN}
+    return dict(sorted(medians.items(), key=lambda item: (item[1], item[0]))[:MAX_ROWS])
+
+
+@mcp.tool(annotations=READ_ONLY)
+def get_request(request_id: str) -> dict:
+    """Return every field of one 311 request, looked up by its request_id.
+
+    Use this when you already have an id, e.g. from search_requests.
+    To find requests by service or neighborhood, use search_requests.
+    """
+    request = BY_ID.get(request_id.strip())
+    if request is None:
+        raise ToolError(f"No request with id {request_id!r}. Use search_requests to find request ids.")
+    return request.as_dict()
 
 
 if __name__ == "__main__":
