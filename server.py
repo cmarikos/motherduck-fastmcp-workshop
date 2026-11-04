@@ -3,6 +3,8 @@
 FastMCP Gateway runs this file. Its entrypoint setting is `server.py:mcp`.
 """
 
+import logging
+import re
 from collections import Counter, defaultdict
 from statistics import median
 from typing import Literal
@@ -11,8 +13,31 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
+from sf311.kit import caller_email
 
 mcp = FastMCP("sf-311")
+log = logging.getLogger("sf311")
+
+HOUSE_NUMBER = re.compile(r"^(\d+)\s+([^,]+)")
+
+
+def _mask_address(address: str) -> str:
+    """Reduce an address to its block: "994 HARRISON ST, ..." -> "900 block of HARRISON ST".
+
+    Addresses without a leading house number (e.g. intersections) are returned unchanged.
+    """
+    match = HOUSE_NUMBER.match(address or "")
+    if not match:
+        return address
+    block = int(match.group(1)) // 100 * 100
+    return f"{block} block of {match.group(2).strip()}"
+
+
+def _public(request: Request) -> dict:
+    """Return a request as a dict with the address masked to the block."""
+    row = request.as_dict()
+    row["address"] = _mask_address(row["address"])
+    return row
 
 MAX_ROWS = 50
 MIN_CLOSED_FOR_MEDIAN = 10
@@ -84,6 +109,7 @@ def search_requests(
 
     Returns up to `limit` rows (1 to 50), each with request_id, opened, closed,
     status, service, subtype, agency, neighborhood, local_name, address and source.
+    Addresses are given only to the block, e.g. "900 block of HARRISON ST".
     Use this to see examples or details of specific cases.
 
     Do not use this to count or to compute times: it returns a sample, not
@@ -96,7 +122,7 @@ def search_requests(
     if not 1 <= limit <= MAX_ROWS:
         raise ToolError(f"limit must be between 1 and {MAX_ROWS}. For totals, use count_requests instead of listing rows.")
     rows = sorted(_matching(service, neighborhood, status), key=lambda r: r.opened, reverse=True)
-    return [r.as_dict() for r in rows[:limit]]
+    return [_public(r) for r in rows[:limit]]
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -159,13 +185,16 @@ def median_close_hours(
 def get_request(request_id: str) -> dict:
     """Return every field of one 311 request, looked up by its request_id.
 
+    The address is given only to the block, e.g. "900 block of HARRISON ST".
+
     Use this when you already have an id, e.g. from search_requests.
     To find requests by service or neighborhood, use search_requests.
     """
+    log.info("get_request request_id=%s caller=%s", request_id, caller_email() or "local")
     request = BY_ID.get(request_id.strip())
     if request is None:
         raise ToolError(f"No request with id {request_id!r}. Use search_requests to find request ids.")
-    return request.as_dict()
+    return _public(request)
 
 
 if __name__ == "__main__":
