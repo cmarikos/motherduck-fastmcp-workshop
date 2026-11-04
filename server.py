@@ -15,6 +15,7 @@ from fastmcp.exceptions import ToolError
 from sf311.data import BY_ID, LOCAL_NAMES, NEIGHBORHOODS, REQUESTS, SERVICES, Request, closest
 from sf311.kit import caller_email
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
 mcp = FastMCP("sf-311")
 log = logging.getLogger("sf311")
 
